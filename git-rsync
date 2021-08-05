@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+#
+# Copyright (c) 2021 Hiroyuki Deguchi
+#
+# This software is released under the MIT License.
+# http://opensource.org/licenses/mit-license.php
+
+set -e
+
+function usage() {
+    cat << _EOT_ >&2
+git-rsync v0.0.1
+
+Usage: $(basename $0) [-n] [-x <pattern>] <command>
+
+  Synchronize the git repository via rsync.
+
+  Remote host and path are set via git config, like this:
+
+    git config --local rsync.remote your_remote_host:/path/to/remote/repo
+
+  If you transfer files via the SSH connection, it can be load the SSH
+  config / SSH agent, or specify the login name and private key, like this:
+
+    git config --local rsync.rsh "ssh -i <indentity_file> -l <login_name>"
+
+  Exclude files are set by .gitignore.
+
+Options:
+  -n          Dry run.
+  -x <pattern>
+              Exclude files matching <pattern>.
+
+Arguments:
+  <command>   push, pull
+
+_EOT_
+}
+
+function err() {
+    echo "$*" >&2
+}
+
+function raise() {
+    if [[ $# -gt 0 ]]; then
+        err "$*"
+    fi
+    exit 1
+}
+
+function check_cmd() {
+    if ! command -v $1 >/dev/null; then
+        raise "$1 is not installed, abort."
+    fi
+}
+
+function parse_args() {
+    argc=0
+    argv=()
+    excludes=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -*)
+                if [[ "$1" =~ "h" ]]; then
+                    usage
+                    exit
+                elif [[ "$1" =~ "n" ]]; then
+                    dry_run="-n"
+                    shift
+                elif [[ "$1" =~ "x" ]]; then
+                    excludes=("${excludes[@]}" "--exclude=$2")
+                    shift 2
+                else
+                    shift
+                fi
+                ;;
+            *)
+                ((++argc))
+                argv=("${argv[@]}" "$1")
+                shift
+                ;;
+        esac
+    done
+
+    if [[ $argc -lt 1 ]] || [[ $argc -gt 2 ]]; then
+        usage
+        raise
+    fi
+}
+
+function clear_excludes_file() {
+    rm -f "$excludes_file"
+}
+
+
+function main() {
+    check_cmd git
+    check_cmd rsync
+
+    parse_args "$@"
+
+    local mode workdir remote_path rsh_cmd
+
+    mode="${argv[0]}"
+    workdir="$(git rev-parse --show-toplevel)" || raise
+    remote_path="$(git config --local --get rsync.remote)" || \
+        raise "Please set rsync.remote via git config."
+
+    if _rsh="$(git config --get rsync.rsh)"; then
+        export RSYNC_RSH="$_rsh"
+    fi
+
+    case $mode in
+        push | ps )
+            local src="$workdir"
+            local dst="$remote_path"
+            ;;
+        pull | pl )
+            local src="$remote_path"
+            local dst="$workdir"
+            ;;
+        * )
+            usage
+            raise
+            ;;
+    esac
+
+    excludes_file="$(mktemp)"
+    trap clear_excludes_file 0 2 9 15
+    git \
+        ls-files \
+        --exclude-standard \
+        -oi \
+        --directory \
+        > "$excludes_file"
+
+    # -a: archive
+    #   -r: recursive
+    #   -l: copy symlinks as symlinks
+    #   -p: preserve permissions
+    #   -t: preserve times
+    #   -g: preserve group
+    #   -o: preserve owner
+    #   --devices: preserve device files
+    #   --specials: preserve special files
+    # -c: skip based on checksum, not mod-time & size
+    # -h: output numbers in a human-readable format
+    # -u: skip files that are newer on the receiver
+    # -v: increase verbosity
+    # -z: compress file data during the transfer
+    # -P:
+    #   --progress: show progress during transfer
+    #   --partial: keep partially transferred files
+    rsync \
+        -achuvzP $dry_run \
+        --exclude-from="$excludes_file" --exclude=".git" "${excludes[@]}" \
+        "$src/" "$dst"
+
+    clear_excludes_file
+}
+
+main "$@"
